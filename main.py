@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import psycopg2
+from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from prophet import Prophet
@@ -39,69 +40,86 @@ conn_pool = SimpleConnectionPool(
 )
 
 # --- Model Caching & Background Training Infrastructure ---
-trained_models = {}
-model_lock = threading.Lock()
+cached_data = {}
+cache_lock = threading.Lock()
 GRANULARITIES = ['day', 'month', 'year']
 RETRAIN_INTERVAL_SECONDS = 86400  # Retrain once every 24 hours
 
-def fetch_cost_data(granularity: str) -> pd.DataFrame:
-    """Fetches and processes cost data from the database for a given granularity."""
-    date_trunc_map = {
-        'day': "date",
-        'month': "DATE_TRUNC('month', date AT TIME ZONE 'America/Los_Angeles')",
-        'year': "DATE_TRUNC('year', date AT TIME ZONE 'America/Los_Angeles')"
-    }
-    date_grouping = date_trunc_map[granularity]
-
-    sql_query = f"""
-        SELECT {date_grouping}::date as ds, SUM(cost) as y
+def fetch_detailed_cost_data() -> pd.DataFrame:
+    """Fetches raw, unaggregated cost data from the database."""
+    sql_query = """
+        SELECT date, cost, service, region, usage_type, operation, linked_account
         FROM aws_cost_details
-        GROUP BY ds
-        ORDER BY ds;
+        ORDER BY date;
     """
     conn = None
     try:
         conn = conn_pool.getconn()
-        with conn.cursor() as cur:
-            cur.execute(sql_query)
-            data = cur.fetchall()
-            if not data:
-                return pd.DataFrame(columns=['ds', 'y'])
-            
-            df = pd.DataFrame(data, columns=['ds', 'y'])
-            df['ds'] = pd.to_datetime(df['ds'])
-            df['y'] = df['y'].astype(float)
-            return df
+        df = pd.read_sql_query(sql_query, conn)
+        if df.empty:
+            return pd.DataFrame()
+        
+        df['date'] = pd.to_datetime(df['date'])
+        df['cost'] = df['cost'].astype(float)
+        return df
     finally:
         if conn:
             conn_pool.putconn(conn)
 
 def retrain_models():
-    """A background task to periodically retrain models for all granularities."""
+    """A background task that fetches detailed data and trains models for all granularities."""
     print("Background training task started.")
     while True:
-        for granularity in GRANULARITIES:
-            try:
-                print(f"[{granularity}] Fetching data for retraining...")
-                df = fetch_cost_data(granularity)
+        try:
+            print("Fetching detailed data for training cycle...")
+            detailed_df = fetch_detailed_cost_data()
 
-                if len(df) < 2:
-                    print(f"[{granularity}] Not enough data to train model. Skipping.")
+            if detailed_df.empty:
+                print("No data found in database. Skipping training cycle.")
+                time.sleep(RETRAIN_INTERVAL_SECONDS)
+                continue
+
+            for granularity in GRANULARITIES:
+                print(f"[{granularity}] Aggregating data for training...")
+                
+                if granularity == 'day':
+                    agg_df = detailed_df.groupby(detailed_df['date'].dt.date)['cost'].sum().reset_index()
+                else:
+                    freq = 'M' if granularity == 'month' else 'Y'
+                    agg_df = detailed_df.groupby(pd.Grouper(key='date', freq=freq))['cost'].sum().reset_index()
+
+                agg_df.rename(columns={'date': 'ds', 'cost': 'y'}, inplace=True)
+                
+                if len(agg_df) < 2:
+                    print(f"[{granularity}] Not enough aggregated data points to train model. Skipping.")
                     continue
 
-                print(f"[{granularity}] Fitting new model...")
-                model = Prophet()
-                model.fit(df)
+                holidays_df = None
+                if granularity == 'day' and not agg_df.empty:
+                    future_period = timedelta(days=365 * 5)
+                    date_range = pd.date_range(start=agg_df['ds'].min(), end=agg_df['ds'].max() + future_period)
+                    billing_days = date_range[date_range.day == 1]
+                    holidays_df = pd.DataFrame({
+                        'holiday': 'monthly_billing',
+                        'ds': pd.to_datetime(billing_days),
+                        'lower_window': 0, 'upper_window': 0,
+                    })
 
-                with model_lock:
-                    trained_models[granularity] = model
+                print(f"[{granularity}] Fitting new model with custom holidays...")
+                model = Prophet(holidays=holidays_df, interval_width=0.99)
+                model.fit(agg_df)
+
+                with cache_lock:
+                    cached_data[granularity] = {
+                        "model": model,
+                        "details": detailed_df if granularity == 'day' else None
+                    }
                 print(f"[{granularity}] Model updated successfully.")
-            except Exception as e:
-                print(f"Error during background model retraining for '{granularity}': {e}")
+        except Exception as e:
+            print(f"An error occurred during the retraining cycle: {e}")
         
         print(f"Next model retraining in {timedelta(seconds=RETRAIN_INTERVAL_SECONDS)}.")
         time.sleep(RETRAIN_INTERVAL_SECONDS)
-
 
 # --- API Routes ---
 
@@ -114,54 +132,85 @@ def hello_world():
 @app.route("/forecast", methods=['GET'])
 def forecast():
     """
-    Performs time series forecasting and anomaly detection using a pre-trained, cached model.
-    Anomalies are identified as historical points where the actual cost falls outside
-    the model's predicted confidence interval (yhat_upper/yhat_lower).
+    Performs time series forecasting and provides detailed anomaly detection.
     """
     granularity = request.args.get('granularity', 'day').lower()
     if granularity not in GRANULARITIES:
         return jsonify({"error": "Invalid granularity. Choose 'day', 'month', or 'year'."}), 400
 
-    with model_lock:
-        model = trained_models.get(granularity)
+    with cache_lock:
+        model_data = cached_data.get(granularity)
+        detailed_data = cached_data.get('day', {}).get('details')
 
-    if not model:
-        return jsonify({"error": f"The model for '{granularity}' granularity is not ready. Please try again later."}), 503
+    if not model_data or not hasattr(detailed_data, 'empty'):
+        return jsonify({"error": f"The model or data for '{granularity}' granularity is not ready yet."}), 503
+
+    model = model_data["model"]
 
     try:
-        # Prediction is fast and done on-demand
-        future = model.make_future_dataframe(periods=30, freq='D')
-        forecast_df = model.predict(future)
+        periods, freq = (12, 'M') if granularity == 'month' else (3, 'Y') if granularity == 'year' else (30, 'D')
         
-        # --- NEW: Anomaly detection using Prophet's model internals ---
-        # Merge historical actuals (y) with forecasts (yhat, yhat_lower, yhat_upper)
-        results_df = pd.merge(forecast_df, model.history, on='ds', how='left')
+        future = model.make_future_dataframe(periods=periods, freq=freq)
+        full_forecast_df = model.predict(future)
         
-        # Identify points where the actual value 'y' is outside the predicted confidence interval
+        results_df = pd.merge(full_forecast_df, model.history, on='ds', how='left')
+        
         anomalies_df = results_df[
             (results_df['y'] > results_df['yhat_upper']) | 
             (results_df['y'] < results_df['yhat_lower'])
         ]
         
-        # Format anomalies for the JSON response
-        anomalies_list = anomalies_df[['ds', 'y']].to_dict(orient='records')
-        for anomaly in anomalies_list:
-            anomaly['ds'] = anomaly['ds'].strftime('%Y-%m-%d')
-        # --- END of new anomaly logic ---
+        anomalies_list = []
+        if not anomalies_df.empty:
+            if granularity == 'day':
+                anomalous_dates = anomalies_df['ds'].dt.date
+                detailed_anomalies = detailed_data[detailed_data['date'].dt.date.isin(anomalous_dates)]
+                
+                # --- NEW: Filter out zero-cost items from the anomaly report ---
+                meaningful_anomalies = detailed_anomalies[detailed_anomalies['cost'] > 0.0]
+                anomalies_list = meaningful_anomalies.to_dict(orient='records')
+                # --- END of new logic ---
 
-        response_data = forecast_df[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_dict(orient='records')
+            else:
+                for _, row in anomalies_df.iterrows():
+                    start_date = row['ds']
+                    end_date = (start_date + relativedelta(months=1) - timedelta(days=1)) if granularity == 'month' else (start_date + relativedelta(years=1) - timedelta(days=1))
+                    
+                    period_details = detailed_data[detailed_data['date'].between(start_date, end_date)]
+                    
+                    # --- NEW: Filter out zero-cost items here as well ---
+                    meaningful_details = period_details[period_details['cost'] > 0.0]
+                    # --- END of new logic ---
+
+                    anomalies_list.append({
+                        "granularity": granularity,
+                        "startDate": start_date.strftime('%Y-%m-%d'),
+                        "endDate": end_date.strftime('%Y-%m-%d'),
+                        "totalAnomalousCost": row['y'],
+                        "costDetails": meaningful_details.to_dict(orient='records')
+                    })
+
+        full_forecast_df.rename(columns={'ds': 'date', 'yhat': 'predictedCost', 'yhat_lower': 'minExpectedCost', 'yhat_upper': 'maxExpectedCost'}, inplace=True)
+        cost_columns = ['predictedCost', 'minExpectedCost', 'maxExpectedCost']
+        full_forecast_df[cost_columns] = full_forecast_df[cost_columns].clip(lower=0)
+        future_forecast_df = full_forecast_df[full_forecast_df['date'].dt.date >= datetime.now().date()]
+        response_data = future_forecast_df[['date', 'predictedCost', 'minExpectedCost', 'maxExpectedCost']].to_dict(orient='records')
         
-        for record in response_data:
-            record['ds'] = record['ds'].strftime('%Y-%m-%d')
+        for record in response_data: record['date'] = record['date'].strftime('%Y-%m-%d')
+        for anomaly in anomalies_list:
+            if 'date' in anomaly: anomaly['date'] = anomaly['date'].strftime('%Y-%m-%d %H:%M:%S')
+            if 'costDetails' in anomaly:
+                for detail in anomaly['costDetails']: detail['date'] = detail['date'].strftime('%Y-%m-%d %H:%M:%S')
 
         return jsonify({"forecast": response_data, "anomalies": anomalies_list})
     except Exception as e:
         print(f"Error during prediction for '{granularity}': {e}")
         return jsonify({"error": "An error occurred during forecasting."}), 500
 
+# The /fetch_aws_cost route remains unchanged...
 @app.route("/fetch_aws_cost", methods=['GET'])
 def fetch_aws_cost():
-    """Fetches detailed AWS cost data, parses it using context, and stores it in the database."""
+    """Fetches detailed AWS cost data, parses it, and stores it in the database."""
     start_date_str = request.args.get('start_date')
     end_date_str = request.args.get('end_date')
 
@@ -169,22 +218,17 @@ def fetch_aws_cost():
         return jsonify({"error": "Please provide both start_date and end_date."}), 400
 
     try:
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').strftime('%Y-%m-%d')
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').strftime('%Y-%m-%d')
+        datetime.strptime(start_date_str, '%Y-%m-%d')
+        datetime.strptime(end_date_str, '%Y-%m-%d')
     except ValueError:
         return jsonify({"error": "Invalid date format. Please use YYYY-MM-DD."}), 400
 
-    cost_data = get_aws_cost_data(start_date, end_date)
+    cost_data = get_aws_cost_data(start_date_str, end_date_str)
     if cost_data is None:
         return jsonify({"error": "Failed to fetch AWS cost data."}), 500
 
-    print(f"Received {len(cost_data)} raw data items from get_aws_cost_data.")
-
     if not cost_data:
         return jsonify({"message": "No AWS cost data found for the specified date range."}), 200
-
-    if not all([db_host, db_port, db_user, db_password, db_database]):
-        return jsonify({"error": "Database connection variables not configured."}), 500
 
     conn = None
     try:
@@ -193,14 +237,11 @@ def fetch_aws_cost():
         )
         cur = conn.cursor()
 
-        # === START: NEW CONTEXT-AWARE PARSING LOGIC ===
         data_to_insert = []
         for result in cost_data:
             date = result.get("TimePeriod", {}).get("Start")
-            # The context you added in the fetch function
             group_by_keys = result.get("GroupByKeys")
 
-            # Skip if the data is missing the date or the context
             if not date or not group_by_keys:
                 continue
 
@@ -215,25 +256,21 @@ def fetch_aws_cost():
 
                 try:
                     cost_amount = float(amount)
-                    
                     dimensions_map = dict(zip(group_by_keys, keys))
-
-                    service = dimensions_map.get('SERVICE', 'N/A')
-                    region = dimensions_map.get('REGION', 'N/A')
-                    usage_type = dimensions_map.get('USAGE_TYPE', 'N/A')
-                    operation = dimensions_map.get('OPERATION', 'N/A')
-                    linked_account = dimensions_map.get('LINKED_ACCOUNT', 'N/A')
                     
                     data_to_insert.append((
-                        date, service, region, usage_type, operation, linked_account, cost_amount, unit
+                        date,
+                        dimensions_map.get('SERVICE', 'N/A'),
+                        dimensions_map.get('REGION', 'N/A'),
+                        dimensions_map.get('USAGE_TYPE', 'N/A'),
+                        dimensions_map.get('OPERATION', 'N/A'),
+                        dimensions_map.get('LINKED_ACCOUNT', 'N/A'),
+                        cost_amount,
+                        unit
                     ))
                 except (ValueError, TypeError):
-                    print(f"Skipping item with invalid cost value: {amount}")
                     continue
-        # === END: NEW CONTEXT-AWARE PARSING LOGIC ===
-
-        print(f"Processed {len(data_to_insert)} items for insertion into the database.")
-
+        
         if not data_to_insert:
             return jsonify({"message": "No valid data to insert after processing."}), 200
 
@@ -242,15 +279,12 @@ def fetch_aws_cost():
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
         cur.executemany(insert_query, data_to_insert)
-
         conn.commit()
-        print(f"Successfully stored/updated {len(data_to_insert)} records in the database.")
 
-        return jsonify({"message": f"Successfully fetched and stored/updated {len(data_to_insert)} AWS cost records."}), 200
+        return jsonify({"message": f"Successfully fetched and stored {len(data_to_insert)} AWS cost records."}), 200
 
     except Exception as e:
-        if conn:
-            conn.rollback()
+        if conn: conn.rollback()
         print(f"Error storing data in database: {e}")
         return jsonify({"error": "An error occurred while storing data."}), 500
     finally:
@@ -258,8 +292,8 @@ def fetch_aws_cost():
             cur.close()
             conn.close()
 
+
 if __name__ == "__main__":
-    # Start the background retraining thread as a daemon so it exits with the main app
     retrain_thread = threading.Thread(target=retrain_models, daemon=True)
     retrain_thread.start()
     
