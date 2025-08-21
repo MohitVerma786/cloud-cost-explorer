@@ -1,0 +1,29 @@
+gitignore
+# Byte-code files
+*.pyc
+__pycache__/
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Flask-specific files
+instance/
+.flaskenv
+
+# IDE specific files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Other common ignored files
+dist/
+build/
+*.log
+*.swp
