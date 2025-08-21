@@ -1,23 +1,109 @@
 import os
-import json
-from flask import Flask, request, jsonify
+import threading
+import time
+from datetime import datetime, timedelta
+
 import pandas as pd
 import psycopg2
-from prophet import Prophet # Keep for now, but consider optimization later
 from dotenv import load_dotenv
-from fetch_aws_cost import get_aws_cost_data # Import the function
-from datetime import datetime # Import datetime for date validation
+from flask import Flask, jsonify, request
+from prophet import Prophet
+from psycopg2.pool import SimpleConnectionPool
+
+from fetch_aws_cost import get_aws_cost_data  # Import the function
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# Get individual PostgreSQL environment variables
+# --- Database Configuration & Connection Pooling ---
 db_host = os.getenv("POSTGRES_DB_HOST")
 db_port = os.getenv("POSTGRES_DB_PORT")
 db_user = os.getenv("POSTGRES_DB_USER")
 db_password = os.getenv("POSTGRES_DB_PASSWORD")
 db_database = os.getenv("POSTGRES_DB_DATABASE")
+
+# Check for DB config at startup to fail fast
+if not all([db_host, db_port, db_user, db_password, db_database]):
+    raise ValueError("Database connection variables are not fully configured.")
+
+# Create a single connection pool when the app starts
+conn_pool = SimpleConnectionPool(
+    minconn=1,
+    maxconn=10,
+    host=db_host,
+    port=db_port,
+    user=db_user,
+    password=db_password,
+    database=db_database
+)
+
+# --- Model Caching & Background Training Infrastructure ---
+trained_models = {}
+model_lock = threading.Lock()
+GRANULARITIES = ['day', 'month', 'year']
+RETRAIN_INTERVAL_SECONDS = 86400  # Retrain once every 24 hours
+
+def fetch_cost_data(granularity: str) -> pd.DataFrame:
+    """Fetches and processes cost data from the database for a given granularity."""
+    date_trunc_map = {
+        'day': "date",
+        'month': "DATE_TRUNC('month', date AT TIME ZONE 'America/Los_Angeles')",
+        'year': "DATE_TRUNC('year', date AT TIME ZONE 'America/Los_Angeles')"
+    }
+    date_grouping = date_trunc_map[granularity]
+
+    sql_query = f"""
+        SELECT {date_grouping}::date as ds, SUM(cost) as y
+        FROM aws_cost_details
+        GROUP BY ds
+        ORDER BY ds;
+    """
+    conn = None
+    try:
+        conn = conn_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute(sql_query)
+            data = cur.fetchall()
+            if not data:
+                return pd.DataFrame(columns=['ds', 'y'])
+            
+            df = pd.DataFrame(data, columns=['ds', 'y'])
+            df['ds'] = pd.to_datetime(df['ds'])
+            df['y'] = df['y'].astype(float)
+            return df
+    finally:
+        if conn:
+            conn_pool.putconn(conn)
+
+def retrain_models():
+    """A background task to periodically retrain models for all granularities."""
+    print("Background training task started.")
+    while True:
+        for granularity in GRANULARITIES:
+            try:
+                print(f"[{granularity}] Fetching data for retraining...")
+                df = fetch_cost_data(granularity)
+
+                if len(df) < 2:
+                    print(f"[{granularity}] Not enough data to train model. Skipping.")
+                    continue
+
+                print(f"[{granularity}] Fitting new model...")
+                model = Prophet()
+                model.fit(df)
+
+                with model_lock:
+                    trained_models[granularity] = model
+                print(f"[{granularity}] Model updated successfully.")
+            except Exception as e:
+                print(f"Error during background model retraining for '{granularity}': {e}")
+        
+        print(f"Next model retraining in {timedelta(seconds=RETRAIN_INTERVAL_SECONDS)}.")
+        time.sleep(RETRAIN_INTERVAL_SECONDS)
+
+
+# --- API Routes ---
 
 @app.route("/")
 def hello_world():
@@ -26,48 +112,52 @@ def hello_world():
   return f"Hello {name}!"
 
 @app.route("/forecast", methods=['GET'])
-def forecast(): # Consider moving Prophet initialization and fitting outside this route for performance
-    """Performs time series forecasting by aggregating total daily costs from the details table."""
-    """Performs time series forecasting by aggregating total daily costs from the details table."""
-    if not all([db_host, db_port, db_user, db_password, db_database]):
-        return jsonify({"error": "Database connection variables not configured."}), 500
+def forecast():
+    """
+    Performs time series forecasting and anomaly detection using a pre-trained, cached model.
+    Anomalies are identified as historical points where the actual cost falls outside
+    the model's predicted confidence interval (yhat_upper/yhat_lower).
+    """
+    granularity = request.args.get('granularity', 'day').lower()
+    if granularity not in GRANULARITIES:
+        return jsonify({"error": "Invalid granularity. Choose 'day', 'month', or 'year'."}), 400
 
-    conn = None
+    with model_lock:
+        model = trained_models.get(granularity)
+
+    if not model:
+        return jsonify({"error": f"The model for '{granularity}' granularity is not ready. Please try again later."}), 503
+
     try:
-        conn = psycopg2.connect(
-            host=db_host, port=db_port, user=db_user, password=db_password, database=db_database
-        )
-        cur = conn.cursor()
+        # Prediction is fast and done on-demand
+        future = model.make_future_dataframe(periods=30, freq='D')
+        forecast_df = model.predict(future)
+        
+        # --- NEW: Anomaly detection using Prophet's model internals ---
+        # Merge historical actuals (y) with forecasts (yhat, yhat_lower, yhat_upper)
+        results_df = pd.merge(forecast_df, model.history, on='ds', how='left')
+        
+        # Identify points where the actual value 'y' is outside the predicted confidence interval
+        anomalies_df = results_df[
+            (results_df['y'] > results_df['yhat_upper']) | 
+            (results_df['y'] < results_df['yhat_lower'])
+        ]
+        
+        # Format anomalies for the JSON response
+        anomalies_list = anomalies_df[['ds', 'y']].to_dict(orient='records')
+        for anomaly in anomalies_list:
+            anomaly['ds'] = anomaly['ds'].strftime('%Y-%m-%d')
+        # --- END of new anomaly logic ---
 
-        # UPDATED QUERY: Sums the costs per day from your new details table
-        cur.execute("""
-            SELECT date, SUM(cost) as total_cost
-            FROM aws_cost_details
-            GROUP BY date
-            ORDER BY date
-        """)
-        data = cur.fetchall()
+        response_data = forecast_df[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_dict(orient='records')
+        
+        for record in response_data:
+            record['ds'] = record['ds'].strftime('%Y-%m-%d')
 
-        if not data:
-            return jsonify({"error": "No AWS cost data found in the database."}), 404
-
-        df = pd.DataFrame(data, columns=['ds', 'y'])
-        df['ds'] = pd.to_datetime(df['ds'])
-
-        model = Prophet()
-        model.fit(df)
-        future = model.make_future_dataframe(periods=30)
-        forecast_data = model.predict(future)
-
-        return jsonify(forecast_data[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_dict(orient='records'))
-
+        return jsonify({"forecast": response_data, "anomalies": anomalies_list})
     except Exception as e:
-        print(f"Error fetching data or performing forecast: {e}")
+        print(f"Error during prediction for '{granularity}': {e}")
         return jsonify({"error": "An error occurred during forecasting."}), 500
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
 
 @app.route("/fetch_aws_cost", methods=['GET'])
 def fetch_aws_cost():
@@ -126,12 +216,8 @@ def fetch_aws_cost():
                 try:
                     cost_amount = float(amount)
                     
-                    # Create a dictionary mapping the dimension name to its value
-                    # e.g., {'SERVICE': 'Amazon S3', 'REGION': 'us-east-1'}
                     dimensions_map = dict(zip(group_by_keys, keys))
 
-                    # Safely get each value, providing 'N/A' as a default
-                    # to satisfy the NOT NULL constraint in your table.
                     service = dimensions_map.get('SERVICE', 'N/A')
                     region = dimensions_map.get('REGION', 'N/A')
                     usage_type = dimensions_map.get('USAGE_TYPE', 'N/A')
@@ -151,10 +237,9 @@ def fetch_aws_cost():
         if not data_to_insert:
             return jsonify({"message": "No valid data to insert after processing."}), 200
 
-        # UPDATED INSERT QUERY: Matches the 'aws_cost_details' table structure
         insert_query = """
             INSERT INTO aws_cost_details (date, service, region, usage_type, operation, linked_account, cost, unit)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
         cur.executemany(insert_query, data_to_insert)
 
@@ -174,4 +259,8 @@ def fetch_aws_cost():
             conn.close()
 
 if __name__ == "__main__":
+    # Start the background retraining thread as a daemon so it exits with the main app
+    retrain_thread = threading.Thread(target=retrain_models, daemon=True)
+    retrain_thread.start()
+    
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
