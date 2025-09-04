@@ -10,6 +10,7 @@ import psycopg2
 from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 from prophet import Prophet
 from psycopg2.pool import SimpleConnectionPool
 
@@ -20,6 +21,7 @@ import google.generativeai as genai
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app)
 
 # --- Database Configuration & Connection Pooling ---
 db_host = os.getenv("POSTGRES_DB_HOST")
