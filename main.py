@@ -3,6 +3,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 import json
+import pickle
 
 import pandas as pd
 import psycopg2
@@ -50,11 +51,33 @@ conn_pool = SimpleConnectionPool(
 )
 
 # --- Model Caching & Background Training Infrastructure ---
-cached_data = {}
-cache_lock = threading.Lock()
 GRANULARITIES = ["day", "month", "year"]
 RETRAIN_INTERVAL_SECONDS = 86400  # Retrain once every 24 hours
 
+
+def create_prophet_models_table():
+    """Creates the prophet_models table if it doesn't exist."""
+    conn = None
+    try:
+        conn = conn_pool.getconn()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS prophet_models (
+                granularity TEXT PRIMARY KEY,
+                model_data BYTEA NOT NULL,
+                details_data BYTEA NOT NULL,
+                last_updated TIMESTAMP NOT NULL
+            );
+        """)
+        conn.commit()
+        print("prophet_models table checked/created successfully.")
+    except Exception as e:
+        print(f"Error creating prophet_models table: {e}")
+    finally:
+        if conn:
+            conn_pool.putconn(conn)
+
+create_prophet_models_table()
 
 def fetch_detailed_cost_data() -> pd.DataFrame:
     """Fetches raw, unaggregated cost data from the database."""
@@ -159,11 +182,31 @@ def retrain_models():
                 model = Prophet(holidays=holidays_df, interval_width=0.99)
                 model.fit(agg_df)
 
-                with cache_lock:
-                    cached_data[granularity] = {
-                        "model": model,
-                        "details": detailed_df, # Store full details for all granularities
-                    }
+                # Serialize model and data
+                model_data_bytes = pickle.dumps(model)
+                details_data_bytes = pickle.dumps(detailed_df)
+
+                # Store in database
+                conn = None
+                try:
+                    conn = conn_pool.getconn()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO prophet_models (granularity, model_data, details_data, last_updated)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (granularity) DO UPDATE SET
+                            model_data = EXCLUDED.model_data,
+                            details_data = EXCLUDED.details_data,
+                            last_updated = EXCLUDED.last_updated;
+                    """, (granularity, model_data_bytes, details_data_bytes, datetime.now()))
+                    conn.commit()
+                    print(f"[{granularity}] Model and data saved to database.")
+                except Exception as e:
+                    print(f"Error saving model to database: {e}")
+                finally:
+                    if conn:
+                        conn_pool.putconn(conn)
+
                 print(f"[{granularity}] Model updated successfully.")
         except Exception as e:
             print(f"An error occurred during the retraining cycle: {e}")
@@ -197,10 +240,20 @@ def forecast():
             400,
         )
 
-    with cache_lock:
-        model_data = cached_data.get(granularity)
+    conn = None
+    try:
+        conn = conn_pool.getconn()
+        cur = conn.cursor()
+        cur.execute("SELECT model_data, details_data FROM prophet_models WHERE granularity = %s", (granularity,))
+        row = cur.fetchone()
+    except Exception as e:
+        print(f"Error fetching model from database: {e}")
+        row = None
+    finally:
+        if conn:
+            conn_pool.putconn(conn)
 
-    if not model_data:
+    if not row:
         return (
             jsonify(
                 {
@@ -210,8 +263,10 @@ def forecast():
             503,
         )
 
-    model = model_data["model"]
-    detailed_data = model_data["details"]
+    # Deserialize model and data
+    model = pickle.loads(row[0])
+    detailed_data = pickle.loads(row[1])
+
 
     try:
         periods, freq = (
