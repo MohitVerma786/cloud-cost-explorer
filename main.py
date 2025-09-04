@@ -408,7 +408,7 @@ def analysis():
             {anomaly_summary}
             """
             try:
-                model = genai.GenerativeModel('gemini-2.5-flash')
+                model = genai.GenerativeModel('gemini-1.5-flash')
                 gemini_response = model.generate_content(prompt)
                 
                 try:
@@ -526,6 +526,48 @@ def fetch_aws_cost():
         if conn:
             cur.close()
             conn.close()
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    """
+    Accepts a question, gets forecast data, and uses Gemini to answer.
+    """
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    question = data.get("question")
+
+    if not question:
+        return jsonify({"error": "Missing 'question' in request body"}), 400
+
+    # Get the forecast data by calling the forecast function
+    # We need to mock a request context for the forecast function to work
+    with app.test_request_context('/forecast?granularity=month'):
+        forecast_response = forecast()
+        forecast_data = forecast_response.get_json()
+
+
+    prompt = f"""
+    Based on the following forecast data, please answer the user's question.
+
+    **Forecast Data:**
+    ```json
+    {json.dumps(forecast_data, indent=2)}
+    ```
+
+    **User's Question:**
+    {question}
+    """
+
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        gemini_response = model.generate_content(prompt)
+        return jsonify({"answer": gemini_response.text})
+
+    except Exception as e:
+        print(f"Error calling Gemini API: {e}")
+        return jsonify({"error": "Could not generate an answer due to an API error."}), 500
 
 
 if __name__ == "__main__":
