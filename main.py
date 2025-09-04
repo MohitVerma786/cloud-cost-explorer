@@ -569,8 +569,13 @@ def chat():
         print(f"Error calling Gemini API: {e}")
         return jsonify({"error": "Could not generate an answer due to an API error."}), 500
 
+# Start the background thread for model retraining
+# This is a temporary solution for single-process environments like Render's free tier.
+# For production, a proper task queue (e.g., Celery) is recommended.
+retrain_thread = threading.Thread(target=retrain_models, daemon=True)
+retrain_thread.start()
 
 if __name__ == "__main__":
-    retrain_thread = threading.Thread(target=retrain_models, daemon=True)
-    retrain_thread.start()
+    # The app.run() call is only for local development.
+    # Gunicorn will be used in production.
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
